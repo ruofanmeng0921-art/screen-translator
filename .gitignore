@@ -1,0 +1,12 @@
+.build/
+.signing/
+dist/
+__pycache__/
+.DS_Store
+*.p12
+*.pfx
+*.key
+*.pem
+*.keychain-db
+.env
+.env.*

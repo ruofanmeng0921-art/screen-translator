@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>local.silver.screen-translator</string>
+  <key>CFBundleName</key><string>屏幕翻译</string>
+  <key>CFBundleDisplayName</key><string>屏幕翻译</string>
+  <key>CFBundleExecutable</key><string>ScreenTranslator</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.5</string>
+  <key>CFBundleVersion</key><string>6</string>
+  <key>CFBundleDevelopmentRegion</key><string>zh-Hans</string>
+  <key>CFBundleLocalizations</key><array><string>zh-Hans</string></array>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>LSMinimumSystemVersion</key><string>26.0</string>
+  <key>LSUIElement</key><true/>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSScreenCaptureUsageDescription</key><string>识别屏幕上的英文并在原位置显示中文；不会录制音频或保存截图。</string>
+  <key>NSPrincipalClass</key><string>NSApplication</string>
+</dict></plist>
