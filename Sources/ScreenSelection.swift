@@ -7,19 +7,25 @@ import ScreenCaptureKit
 final class ScreenSelection: NSObject, SCContentSharingPickerObserver {
     static let shared = ScreenSelection()
     private let picker = SCContentSharingPicker.shared
-    private var pending: CheckedContinuation<SCContentFilter, Error>?
+    private struct PendingSelection {
+        let id: UUID
+        let continuation: CheckedContinuation<SCContentFilter, Error>
+    }
+    private var pending: PendingSelection?
     private var filter: SCContentFilter?
     private var registered = false
 
     func select() async throws -> SCContentFilter {
         if let filter { return filter }
+        let requestID = UUID()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 guard !Task.isCancelled else {
                     continuation.resume(throwing: CancellationError())
                     return
                 }
-                pending = continuation
+                cancelSelection()
+                pending = PendingSelection(id: requestID, continuation: continuation)
                 if !registered {
                     picker.add(self)
                     registered = true
@@ -35,13 +41,13 @@ final class ScreenSelection: NSObject, SCContentSharingPickerObserver {
                 picker.present(using: .display)
             }
         } onCancel: {
-            Task { @MainActor in self.cancelPending() }
+            Task { @MainActor in self.cancelSelection(requestID: requestID) }
         }
     }
 
     func reset() {
         filter = nil
-        cancelPending()
+        cancelSelection()
     }
 
     func shutdown() {
@@ -50,30 +56,35 @@ final class ScreenSelection: NSObject, SCContentSharingPickerObserver {
         picker.isActive = false
     }
 
-    private func cancelPending() {
-        let continuation = pending
-        pending = nil
-        continuation?.resume(throwing: CancellationError())
+    func cancelSelection() { cancelSelection(requestID: nil) }
+
+    private func cancelSelection(requestID: UUID?) {
+        guard let pending, requestID == nil || pending.id == requestID else { return }
+        let continuation = pending.continuation
+        self.pending = nil
+        picker.isActive = false
+        continuation.resume(throwing: CancellationError())
     }
 
     nonisolated func contentSharingPicker(_ picker: SCContentSharingPicker,
                                           didUpdateWith filter: SCContentFilter, for stream: SCStream?) {
         Task { @MainActor in
-            guard let continuation = self.pending else { return }
+            guard let pending = self.pending else { return }
             self.pending = nil
             self.filter = filter
-            continuation.resume(returning: filter)
+            pending.continuation.resume(returning: filter)
         }
     }
 
     nonisolated func contentSharingPicker(_ picker: SCContentSharingPicker, didCancelFor stream: SCStream?) {
-        Task { @MainActor in self.cancelPending() }
+        Task { @MainActor in self.cancelSelection() }
     }
 
     nonisolated func contentSharingPickerStartDidFailWithError(_ error: Error) {
         Task { @MainActor in
-            let continuation = self.pending
+            let continuation = self.pending?.continuation
             self.pending = nil
+            picker.isActive = false
             continuation?.resume(throwing: error)
         }
     }

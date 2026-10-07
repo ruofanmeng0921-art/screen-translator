@@ -6,8 +6,8 @@
   <key>CFBundleDisplayName</key><string>屏幕翻译</string>
   <key>CFBundleExecutable</key><string>ScreenTranslator</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.5</string>
-  <key>CFBundleVersion</key><string>6</string>
+  <key>CFBundleShortVersionString</key><string>1.6</string>
+  <key>CFBundleVersion</key><string>7</string>
   <key>CFBundleDevelopmentRegion</key><string>zh-Hans</string>
   <key>CFBundleLocalizations</key><array><string>zh-Hans</string></array>
   <key>CFBundleIconFile</key><string>AppIcon</string>

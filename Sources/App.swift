@@ -191,45 +191,47 @@ final class AppleButton: NSView {
 }
 
 struct LanguageSetupView: View {
+    @ObservedObject var model: LanguageSetupModel
     let onReady: () -> Void
-    @State private var configuration: TranslationSession.Configuration?
-    @State private var working = false
-    @State private var message = "首次使用需要英文与中文语言包。下载后，翻译可在本机完成。"
+    let onCancel: () -> Void
     var body: some View {
+        let downloadID = model.downloadRequestID
         VStack(alignment: .leading, spacing: 18) {
             Text("准备英文 → 中文").font(.title2).fontWeight(.medium)
-            Text(message).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            Button(working ? "正在准备…" : "下载语言包") {
-                working = true
-                configuration = .init(source: Locale.Language(identifier: "en"),
-                                      target: Locale.Language(identifier: "zh-Hans"))
-            }.buttonStyle(.borderedProminent).disabled(working)
-        }
-        .padding(28).frame(width: 370)
-        .translationTask(configuration) { session in
-            guard configuration != nil else { return }
-            do {
-                try await session.prepareTranslation()
-                _ = try await session.translate("Create and edit documents")
-                await MainActor.run { onReady() }
-            } catch {
-                await MainActor.run {
-                    working = false
-                    configuration = nil
-                    message = "语言包尚未准备完成：\(error.localizedDescription)"
+            Text(model.message).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            HStack {
+                if model.phase == .checking || model.phase == .downloading { ProgressView().controlSize(.small) }
+                if model.phase == .missing {
+                    Button("下载语言包") { model.download() }.buttonStyle(.borderedProminent)
+                } else if model.phase == .ready {
+                    Button(model.resumeWhenReady ? "开始翻译" : "完成", action: onReady).buttonStyle(.borderedProminent)
+                } else if case .failed = model.phase {
+                    Button("重新检查") { Task { await model.check() } }.buttonStyle(.borderedProminent)
+                }
+                if model.phase == .downloading {
+                    Button("取消", action: onCancel)
                 }
             }
         }
+        .padding(28).frame(width: 370)
+        .task { await model.check() }
+        .translationTask(model.configuration) { session in
+            if let downloadID { await model.finishDownload(using: session, requestID: downloadID) }
+        }
+        .onChange(of: model.phase) { _, phase in if phase == .ready && model.resumeWhenReady { onReady() } }
+        .onChange(of: model.resumeWhenReady) { _, resume in if resume && model.phase == .ready { onReady() } }
+        .onDisappear { model.cancel() }
     }
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let engine = ScreenEngine()
     private var logoWindow: NSPanel!
     private var apple: AppleButton!
     private var statusItem: NSStatusItem!
     private var setupWindow: NSWindow?
+    private var setupModel: LanguageSetupModel?
     private var globalMonitor: Any?
     private var localMonitor: Any?
     private var workspaceObserver: NSObjectProtocol?
@@ -249,7 +251,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.apple.state = state
             self?.statusItem.menu = self?.makeMenu()
         }
-        engine.onLanguageSetup = { [weak self] in self?.showLanguageSetup() }
+        engine.onLanguageSetup = { [weak self] in self?.showLanguageSetup(resumeWhenReady: true) }
         engine.onError = { [weak self] message in self?.showError(message) }
         engine.onProgress = { [weak self] count in
             self?.apple.setAccessibilityValue(count > 0 ? "正在显示 \(count) 处中文翻译" : "")
@@ -318,7 +320,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         select.target = self
         menu.addItem(select)
         menu.addItem(.separator())
-        let models = NSMenuItem(title: "准备翻译语言包…", action: #selector(prepareLanguages), keyEquivalent: "")
+        let models = NSMenuItem(title: "检查翻译语言包…", action: #selector(prepareLanguages), keyEquivalent: "")
         models.target = self
         menu.addItem(models)
         let help = NSMenuItem(title: "使用说明", action: #selector(showHelp), keyEquivalent: "")
@@ -333,32 +335,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func toggleTranslation() { engine.toggle() }
     @objc func toggleOriginal() { engine.showOriginal() }
     @objc func chooseScreen() { engine.chooseScreen() }
-    @objc func prepareLanguages() { engine.stop(); showLanguageSetup() }
+    @objc func prepareLanguages() { showLanguageSetup() }
     @objc func quitApp() { engine.stop(); NSApp.terminate(nil) }
     @objc func showHelp() {
         let alert = NSAlert()
-        alert.messageText = "屏幕翻译"
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+        alert.messageText = "屏幕翻译 \(version)"
         alert.informativeText = "点击小苹果：开始／暂停。\n拖动小苹果：移动位置。\n右键小苹果：选屏、语言包、原文和退出。\n\n英文识别和翻译在本机进行，不保存屏幕截图。每轮约一秒，长句与首次出现的内容可能稍慢。\n\n出现系统选屏界面时，选择要翻译的完整屏幕并确认共享。本次运行中暂停再开始会沿用选择；退出应用后需要重新选屏。"
         alert.addButton(withTitle: "知道了")
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
     }
 
-    func showLanguageSetup() {
-        if let setupWindow { setupWindow.makeKeyAndOrderFront(nil); return }
-        let window = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 400, height: 210),
+    func showLanguageSetup(resumeWhenReady: Bool = false) {
+        if let setupWindow {
+            if resumeWhenReady { setupModel?.resumeWhenReady = true }
+            setupWindow.makeKeyAndOrderFront(nil)
+            return
+        }
+        let window = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 426, height: 250),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "准备系统翻译"
         window.isReleasedWhenClosed = false
-        window.contentView = NSHostingView(rootView: LanguageSetupView { [weak self] in
-            self?.setupWindow?.orderOut(nil)
-            self?.setupWindow = nil
-            self?.engine.start()
-        })
+        window.delegate = self
+        let model = LanguageSetupModel()
+        model.resumeWhenReady = resumeWhenReady
+        setupModel = model
+        window.contentView = NSHostingView(rootView: LanguageSetupView(model: model, onReady: { [weak self] in
+            guard let self else { return }
+            let resume = model.resumeWhenReady
+            self.setupWindow?.close()
+            if resume { self.engine.start() }
+        }, onCancel: { [weak self] in self?.setupWindow?.close() }))
         setupWindow = window
         window.center()
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window === setupWindow else { return }
+        setupModel?.cancel()
+        setupModel = nil
+        setupWindow = nil
+        window.contentView = nil
     }
 
     func showError(_ failure: TranslatorFailure) {
@@ -374,6 +394,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     func applicationWillTerminate(_ notification: Notification) {
+        setupModel?.cancel()
         engine.stop()
         ScreenSelection.shared.shutdown()
         if let globalMonitor { NSEvent.removeMonitor(globalMonitor) }

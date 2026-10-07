@@ -37,10 +37,12 @@ enum SelfTest {
             if let url = Bundle.main.url(forResource: "apple-logo", withExtension: "svg"),
                NSImage(contentsOf: url) != nil { print("PASS: Official logo resource loads") }
             else { throw NSError(domain: "SelfTest.Logo", code: 4) }
-            let source = Locale.Language(identifier: "en"), target = Locale.Language(identifier: "zh-Hans")
-            let status = await LanguageAvailability().status(from: source, to: target)
-            if status == .installed {
-                let session = TranslationSession(installedSource: source, target: target)
+            try await checkLanguageSetup()
+            let pair = await LanguageResources.pair()
+            let session = LanguageResources.installedSession(pair)
+            defer { session.cancel() }
+            let readiness = try await LanguageResources.readiness(session, pair: pair)
+            if readiness == .ready {
                 let result = try await session.translate("Create and edit documents")
                 guard result.targetText.unicodeScalars.contains(where: { (0x3400...0x9FFF).contains($0.value) }) else {
                     throw NSError(domain: "SelfTest.Translation", code: 5)
@@ -61,13 +63,81 @@ enum SelfTest {
                 }
                 print("PASS: Unknown specialist term preserved in local translation: \(response.targetText)")
             } else {
-                print("PENDING: Apple translation language pack status = \(status)")
+                print("PENDING: Apple translation language pack readiness = \(readiness)")
             }
             print("Self-test finished")
         } catch {
             fputs("FAIL: \(error.localizedDescription)\n", stderr)
             exit(1)
         }
+    }
+
+    @MainActor private static func checkLanguageSetup() async throws {
+        let pair = await LanguageResources.pair()
+        let configuration = LanguageResources.configuration(pair)
+        let session = LanguageResources.installedSession(pair)
+        defer { session.cancel() }
+        guard !session.canRequestDownloads,
+              configuration.source == pair.source, configuration.target == pair.target else {
+            throw failure("Installed-resource checks must never request a language download")
+        }
+        if #available(macOS 26.4, *) {
+            guard configuration.preferredStrategy == .lowLatency,
+                  session.preferredStrategy == .lowLatency,
+                  LanguageResources.availability().preferredStrategy == .lowLatency else {
+                throw failure("Language availability, downloads, and translation must use the same models")
+            }
+        }
+        var readiness: LanguageReadiness = .missing
+        let missing = LanguageSetupModel(checker: { _, _ in readiness })
+        await missing.check()
+        guard missing.phase == .missing else { throw failure("Missing languages must offer preparation") }
+        missing.download()
+        guard missing.phase == .downloading, missing.configuration != nil else { throw failure("Download did not start") }
+        let firstID = missing.downloadRequestID!
+        let firstVersion = missing.configuration!.version
+        missing.cancel()
+        guard missing.configuration == nil, missing.phase == .missing else { throw failure("Cancel must invalidate download work") }
+        await missing.check()
+        missing.download()
+        guard missing.downloadRequestID != firstID, missing.configuration!.version > firstVersion else {
+            throw failure("Retry must create a new task even with the same language pair")
+        }
+        readiness = .ready
+        await missing.finishDownload(using: session, requestID: firstID)
+        guard missing.phase == .downloading else { throw failure("A stale download callback changed the retry") }
+        missing.cancel()
+
+        var held: CheckedContinuation<LanguageReadiness, Never>?
+        let cancelled = LanguageSetupModel(checker: { _, _ in
+            await withCheckedContinuation { held = $0 }
+        })
+        let checking = Task { await cancelled.check() }
+        for _ in 0..<1000 {
+            if held != nil { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        guard let continuation = held else { checking.cancel(); throw failure("Check did not begin") }
+        cancelled.cancel()
+        continuation.resume(returning: .ready)
+        await checking.value
+        guard cancelled.phase != .ready else { throw failure("A closed setup window accepted a stale completion") }
+        print("PASS: Consistent model choice, missing-language setup, cancellation, and stale completion rejection")
+
+        let installed = LanguageSetupModel()
+        await installed.check()
+        if installed.phase == .ready {
+            installed.download()
+            guard installed.phase == .ready, installed.configuration == nil else {
+                throw failure("Already installed languages prompted another download")
+            }
+            await installed.check()
+            guard installed.phase == .ready, installed.configuration == nil else {
+                throw failure("Repeated language checks lost installed resources")
+            }
+            print("PASS: Already installed languages stay ready across repeated checks without a download task")
+        }
+        installed.cancel()
     }
 
     @MainActor private static func checkTerminologyRules() throws {

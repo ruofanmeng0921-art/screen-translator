@@ -17,6 +17,7 @@ final class ScreenEngine {
     }
     private var task: Task<Void, Never>?
     private var captureSession: CaptureSession?
+    private var translationSession: TranslationSession?
     private var generation = UUID()
     private var overlays: [CGDirectDisplayID: OverlayWindow] = [:]
     private var cache: [String: String] = [:]
@@ -26,8 +27,6 @@ final class ScreenEngine {
     private var logoDragging = false
     private var contentRevision: UInt64 = 0
     private var showingOriginal: Bool { manualOriginal || interactionSuppressed || logoDragging }
-    let source = Locale.Language(identifier: "en")
-    let target = Locale.Language(identifier: "zh-Hans")
 
     func toggle() {
         if state == .paused { start() } else { stop() }
@@ -44,6 +43,8 @@ final class ScreenEngine {
         generation = UUID()
         task?.cancel()
         task = nil
+        translationSession?.cancel()
+        translationSession = nil
         captureSession?.stop()
         captureSession = nil
         state = .paused
@@ -52,6 +53,7 @@ final class ScreenEngine {
         interactionSuppressed = false
         logoDragging = false
         restoreTimer?.invalidate()
+        ScreenSelection.shared.cancelSelection()
         overlays.values.forEach { $0.clear() }
     }
 
@@ -86,26 +88,29 @@ final class ScreenEngine {
         generation = token
         task = Task { [weak self] in
             guard let self else { return }
-            let availability = await LanguageAvailability().status(from: source, to: target)
+            let pair = await LanguageResources.pair()
             guard generation == token, !Task.isCancelled else { return }
-            guard availability == .installed else {
-                stop()
-                if availability == .supported { onLanguageSetup?() }
-                else { onError?(TranslatorFailure(message: "这台 Mac 的系统翻译暂不支持英文到简体中文。")) }
-                return
-            }
-            let session = TranslationSession(installedSource: source, target: target)
+            let session = LanguageResources.installedSession(pair)
+            translationSession = session
             let capture = CaptureSession()
             captureSession = capture
             defer { capture.stop() }
             var readingScreen = false
             do {
                 // Check translation before beginning a recurring capture session.
-                _ = try await session.translate("Hello")
+                let readiness = try await LanguageResources.readiness(session, pair: pair)
                 guard generation == token, !Task.isCancelled else { return }
+                guard readiness == .ready else {
+                    stop()
+                    if readiness == .missing { onLanguageSetup?() }
+                    else { onError?(TranslatorFailure(message: "这台 Mac 的系统翻译暂不支持英文到简体中文。")) }
+                    return
+                }
                 readingScreen = true
                 try await capture.start()
                 guard generation == token, !Task.isCancelled else { return }
+                let firstFrameDeadline = ProcessInfo.processInfo.systemUptime + 15
+                var receivedFrame = false
                 var recognizedFrames = [CGDirectDisplayID: (sequence: UInt64, lines: [ScreenLine])]()
                 while generation == token, !Task.isCancelled {
                     if showingOriginal {
@@ -122,6 +127,7 @@ final class ScreenEngine {
                         guard generation == token, !Task.isCancelled else { return }
                         guard let id = Self.displayID(screen),
                               let frame = try capture.frame(for: id) else { continue }
+                        receivedFrame = true
                         let revision = contentRevision
                         // Running means a real frame arrived, not merely that
                         // translation or a permission preflight succeeded.
@@ -173,6 +179,10 @@ final class ScreenEngine {
                             translatedCount += result.count
                         }
                     }
+                    if !receivedFrame && ProcessInfo.processInfo.systemUptime > firstFrameDeadline {
+                        throw NSError(domain: "ScreenTranslator.Capture", code: 3,
+                                      userInfo: [NSLocalizedDescriptionKey: "已连接屏幕，但没有收到画面。请暂停后重新选择完整屏幕。"])
+                    }
                     onProgress?(translatedCount)
                     try await Task.sleep(for: .milliseconds(900))
                 }
@@ -180,6 +190,7 @@ final class ScreenEngine {
                 guard generation == token, !Task.isCancelled else { return }
                 stop()
                 if error is CancellationError { return }
+                if !readingScreen && TranslationError.notInstalled ~= error { onLanguageSetup?(); return }
                 if readingScreen { ScreenSelection.shared.reset() }
                 onError?(readingScreen ? .capture(error) : TranslatorFailure(message: "翻译已暂停：\(error.localizedDescription)"))
             }
